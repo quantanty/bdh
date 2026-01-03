@@ -1,1 +1,14 @@
+# data
 input.txt
+# python
+__pycache__/
+
+# editors
+.vscode/
+
+# log files
+logs/
+
+# model checkpoints
+*.pth
+*.pt
