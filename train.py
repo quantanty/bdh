@@ -1,14 +1,16 @@
 # Copyright Pathway Technology, Inc.
 
 import os
+from argparse import ArgumentParser
 from contextlib import nullcontext
 
-import bdh
 import numpy as np
 import requests
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import bdh
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # On a Mac you can also try
@@ -39,13 +41,16 @@ print(f"Using device: {device} with dtype {dtype}")
 # Configuration
 BDH_CONFIG = bdh.BDHConfig()
 BLOCK_SIZE = 512
-BATCH_SIZE = 32
-MAX_ITERS = 3000
+BATCH_SIZE = 16
+GRADIENT_ACCUMULATION_STEPS = 2
+MAX_ITERS = 200
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 0.1
-LOG_FREQ = 100
+LOG_FREQ = 10
+CHECKPOINT_FREQ = 100
 
 input_file_path = os.path.join(os.path.dirname(__file__), "input.txt")
+output_dir = "v0"
 
 
 # Fetch the tiny Shakespeare dataset
@@ -56,20 +61,20 @@ def fetch_data():
             f.write(requests.get(data_url).text)
 
 
-def get_batch(split):
+def get_batch(split, block_size, batch_size):
     # treat the file as bytes
     data = np.memmap(input_file_path, dtype=np.uint8, mode="r")
     if split == "train":
         data = data[: int(0.9 * len(data))]
     else:
         data = data[int(0.9 * len(data)) :]
-    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
+    ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack(
-        [torch.from_numpy((data[i : i + BLOCK_SIZE]).astype(np.int64)) for i in ix]
+        [torch.from_numpy((data[i : i + block_size]).astype(np.int64)) for i in ix]
     )
     y = torch.stack(
         [
-            torch.from_numpy((data[i + 1 : i + 1 + BLOCK_SIZE]).astype(np.int64))
+            torch.from_numpy((data[i + 1 : i + 1 + block_size]).astype(np.int64))
             for i in ix
         ]
     )
@@ -86,9 +91,30 @@ def get_batch(split):
 def eval(model):
     model.eval()
 
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument("--block-size", type=int, default=BLOCK_SIZE, required=False)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, required=False)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=GRADIENT_ACCUMULATION_STEPS, required=False)
+    parser.add_argument("--max-iters", type=int, default=MAX_ITERS, required=False)
+    parser.add_argument("--log-freq", type=int, default=LOG_FREQ, required=False)
+    parser.add_argument("--checkpoint-freq", type=int, default=CHECKPOINT_FREQ, required=False)
+    parser.add_argument("--output-dir", type=str, default=output_dir, required=False)
+    return parser.parse_args()
 
 if __name__ == "__main__":
+    args = parse_args()
+    block_size = args.block_size
+    batch_size = args.batch_size
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+    max_iters = args.max_iters
+    log_freq = args.log_freq
+    checkpoint_freq = args.checkpoint_freq
+    output_dir = args.output_dir
+
     fetch_data()
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     model = bdh.BDH(BDH_CONFIG).to(device)
     model = torch.compile(model)
@@ -96,24 +122,26 @@ if __name__ == "__main__":
         model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
 
-    x, y = get_batch("train")
+    x, y = get_batch("train", block_size, batch_size)
 
-    loss_acc = 0
-    loss_steps = 0
-    for step in range(MAX_ITERS):
-        with ctx:
-            logits, loss = model(x, y)
-        x, y = get_batch("train")
-        loss_acc += loss
-        loss_steps += 1
-        scaler.scale(loss).backward()
+    for step in range(max_iters):
+        loss_acc = 0
+        for micro_step in range(gradient_accumulation_steps):
+            x, y = get_batch("train", block_size, batch_size)
+            with ctx:
+                logits, loss = model(x, y)
+            loss = loss / gradient_accumulation_steps
+            loss_acc += loss
+            scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
         optimizer.zero_grad()
-        if step % LOG_FREQ == 0:
-            print(f"Step: {step}/{MAX_ITERS} loss {loss_acc.item() / loss_steps:.3}")
-            loss_acc = 0
-            loss_steps = 0
+        if step % log_freq == 0:
+            print(f"Step: {step}/{max_iters} loss {loss_acc:.3}")
+        if output_dir and step % checkpoint_freq == 0 and step > 0:
+            torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'step': step}, f'{output_dir}/checkpoint_{step}.pt')
+    if output_dir:
+        torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'step': max_iters}, f'{output_dir}/final_checkpoint.pt')
     print("Training done, now generating a sample ")
     model.eval()
     prompt = torch.tensor(
