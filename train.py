@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import bdh
+import bdh.bdh2 as bdh
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # On a Mac you can also try
@@ -118,6 +118,7 @@ if __name__ == "__main__":
 
     model = bdh.BDH(BDH_CONFIG).to(device)
     model = torch.compile(model)
+        
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
     )
@@ -129,7 +130,7 @@ if __name__ == "__main__":
         for micro_step in range(gradient_accumulation_steps):
             x, y = get_batch("train", block_size, batch_size)
             with ctx:
-                logits, loss = model(x, y)
+                logits, loss, _ = model(x, targets=y)
             loss = loss / gradient_accumulation_steps
             loss_acc += loss
             scaler.scale(loss).backward()
@@ -147,7 +148,7 @@ if __name__ == "__main__":
     prompt = torch.tensor(
         bytearray("To be or ", "utf-8"), dtype=torch.long, device=device
     ).unsqueeze(0)
-    ret = model.generate(prompt, max_new_tokens=100, top_k=3)
+    ret, _, _ = model.generate(prompt, max_new_tokens=100, top_k=3, cache_method='state')
     ret_decoded = bytes(ret.to(torch.uint8).to("cpu").squeeze(0)).decode(
         errors="backslashreplace"
     )
